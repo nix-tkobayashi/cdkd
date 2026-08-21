@@ -2838,7 +2838,14 @@ ones it could not examine. A conditional import does NOT refuse when its branch
 is not taken: the pre-pass walks `Fn::If` the way the resolver does, selected
 branch only, and neither does a `Fn::ImportValue` inside an output that this
 run's conditions SUPPRESS -- such an output wrote no state key, so there is
-nothing behind it to protect.
+nothing behind it to protect. The same branch selection now decides whether the
+PRODUCER's export counts as secret-bearing at all (issue
+[go-to-k/cdkd#2150](https://github.com/go-to-k/cdkd/issues/2150)): that test
+used to scan the whole output node as text, so an `Fn::If` whose UNTAKEN arm
+held a `{{resolve:...}}` expression made the export look secret-bearing while
+the deployed value was the plain branch -- and the refusal below then fired over
+a stored value nothing could turn into an expression, with no bypass flag. One
+selection now feeds both halves of the question.
 
 **Which branch scrub selects is evaluated against the template's DEFAULT
 parameter values.** `scrub` takes no `--parameters`, so it has nothing else to
@@ -2874,7 +2881,12 @@ multi-stack app that imports anything. That half is taken from the app's
 TEMPLATES, and the refusal fires only when they say the value carries a secret:
 either the producer declares that export from a `{{resolve:...}}` expression, or
 the producer RE-EXPORTS a value that a stack further up the chain declares from
-one (issue [go-to-k/cdkd#2146](https://github.com/go-to-k/cdkd/issues/2146)). An
+one (issue [go-to-k/cdkd#2146](https://github.com/go-to-k/cdkd/issues/2146)).
+Both arms read the export through the SAME `Fn::If` branch selection described
+above, so an expression sitting only in a branch this run does not select
+answers neither of them -- and the residual is stated rather than implied: a
+secret reachable only through that branch is not detected, which is the outcome
+that reference had before this refusal existed. An
 ordinary import of a bucket name or an ARN is unaffected under either arm. The chain arm
 is not a refinement: a middle stack's output IS the `Fn::ImportValue`, so asking
 that one template answered "not secret-bearing", and `cdkd scrub <the stack at

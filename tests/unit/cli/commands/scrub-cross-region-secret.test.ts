@@ -206,6 +206,20 @@ const JOIN_SPLIT_EXPR = {
  * than by the guard.
  */
 const TRAILING_SUB_NAME_EXPR = `{{resolve:secretsmanager:${SECRET_NAME}:SecretString:\${Field}}}`;
+/**
+ * The shape issue [#2157](https://github.com/go-to-k/cdkd/issues/2157) unlocks,
+ * and the one whose refusal actually cost something: a WELL-FORMED reference to
+ * a FOREIGN secret, assembled by `Fn::Sub` out of a parameter holding the ARN.
+ * The raw leaf opens one reference and yields zero whole tokens, so the pre-pass
+ * cannot classify it -- but `resolveSub` produces a complete ARN-form expression
+ * that the resolver routes correctly. Pre-#2157 the whole stack refused.
+ */
+const SUB_ASSEMBLED_FOREIGN_ARN_EXPR = {
+  'Fn::Sub': [
+    `{{resolve:secretsmanager:\${SecretArn}:SecretString:password}}`,
+    { SecretArn: PRODUCER_ARN },
+  ],
+};
 const TRAILING_SUB_ARN_EXPR = `{{resolve:secretsmanager:${PRODUCER_ARN}:SecretString:\${Field}}}`;
 
 /**
@@ -422,14 +436,21 @@ describe('a region-AMBIGUOUS refusal is not swallowed by the best-effort catch (
    *
    * THE SHAPE HAD TO BE CHOSEN, not guessed, and the first attempt was wrong.
    * A leaf that spells `{{resolve:` literally -- including the template string
-   * of an `Fn::Sub` -- is caught by the PRE-PASS (`SCRUB_SECRET_REFERENCE_
-   * UNCLASSIFIABLE`), which is correctly placed OUTSIDE the catch and so proves
-   * nothing about it. The shape that reaches the resolver is the one issue
-   * #2134's scope-correction comment names: the OPENING itself is contributed
-   * by an intrinsic. Here a template `Parameter` holds the reference as its
-   * `Default` and the property is `{"Fn::Sub": "${DbSecretRef}"}`, so the raw
-   * leaf is `"${DbSecretRef}"` -- no opening at all, returned by identity,
-   * assembled only inside `resolveSub`.
+   * of an `Fn::Sub` -- used to be caught by the PRE-PASS
+   * (`SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE`), which is correctly placed OUTSIDE
+   * the catch and so proved nothing about it. The shape that reaches the
+   * resolver is the one issue #2134's scope-correction comment names: the
+   * OPENING itself is contributed by an intrinsic. Here a template `Parameter`
+   * holds the reference as its `Default` and the property is
+   * `{"Fn::Sub": "${DbSecretRef}"}`, so the raw leaf is `"${DbSecretRef}"` -- no
+   * opening at all, returned by identity, assembled only inside `resolveSub`.
+   *
+   * Issue [#2157](https://github.com/go-to-k/cdkd/issues/2157) has since made
+   * the literal-spelling shape reach the resolver too (the pre-pass defers
+   * rather than refusing), so this fixture is no longer the ONLY one that gets
+   * there. It is kept as-is because it reaches the resolver for a DIFFERENT
+   * reason -- the pre-pass never sees an opening at all -- and that route is
+   * unaffected by #2157, so it still fences the catch independently.
    */
   const ASSEMBLED_VIA_PARAMETER = { 'Fn::Sub': '${DbSecretRef}' };
   const PARAMETER_HOLDING_REFERENCE = { DbSecretRef: { Type: 'String', Default: NAME_EXPR } };
@@ -444,16 +465,24 @@ describe('a region-AMBIGUOUS refusal is not swallowed by the best-effort catch (
 
   it('the PRE-PASS did not fire -- this leaf really did reach the resolver', async () => {
     // The premise, and it is load-bearing rather than decoration: if the
-    // pre-pass had refused, the test above would pass while saying nothing
-    // about the catch, which is exactly how its first draft failed. The two
-    // refusals carry DIFFERENT codes, so pinning the code above already
-    // separates them -- this asserts the negative directly so a future change
-    // that merged the codes could not quietly re-vacuum the case.
+    // pre-pass had answered this leaf, the test above would pass while saying
+    // nothing about the catch, which is exactly how its first draft failed.
+    //
+    // RE-POINTED by issue [#2157](https://github.com/go-to-k/cdkd/issues/2157).
+    // This used to assert that the error was NOT the pre-pass's own
+    // `SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE`, which was a real discriminator
+    // while that refusal existed. It no longer does -- the pre-pass DEFERS
+    // instead -- so the same assertion would now be true of every possible
+    // outcome, i.e. vacuous. The premise is asserted through what the pre-pass
+    // still DOES rather than through what it no longer throws: it can perform a
+    // region-pinned lookup of its own, and an empty send log therefore proves
+    // it returned this leaf untouched and the resolver alone answered.
     useState(makeLeakyState(IRELAND_PASSWORD, 'imports', IRELAND_PASSWORD));
 
     await expect(
       scrub(ASSEMBLED_VIA_PARAMETER, undefined, undefined, PARAMETER_HOLDING_REFERENCE)
-    ).rejects.not.toMatchObject({ code: 'SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE' });
+    ).rejects.toMatchObject({ code: 'DYNAMIC_REFERENCE_REGION_AMBIGUOUS' });
+    expect(secretSends).toHaveLength(0);
   });
 
   it('CONTROL: with NO cross-region read on record the same template scrubs normally', async () => {
@@ -637,39 +666,48 @@ describe('cdkd scrub resolves a foreign-region secret in ITS OWN region (issue #
     expect(JSON.stringify(saved)).not.toContain(TOKYO_PASSWORD);
   });
 
-  it('an Fn::Sub-ASSEMBLED reference is REFUSED, not handed to the stack region', async () => {
+  it('an Fn::Sub-ASSEMBLED reference is refused by the RESOLVER, after assembly (#2157)', async () => {
     // The token scan finds NOTHING in an assembled reference — `[^}]+` cannot
-    // cross the `}` of `${Env}` — so the leaf carries a reference this pre-pass
-    // cannot classify at all, and returning it by identity lets `resolveSub`
-    // hand the assembled expression to the PRIMARY resolver: issue #2109
-    // verbatim, with the ambiguous refusal never firing.
+    // cross the `}` of `${Env}` — so this pre-pass cannot classify the leaf and
+    // hands it on BY IDENTITY. `resolveSub` then assembles
+    // `{{resolve:secretsmanager:prod-db:SecretString:password}}` and the PRIMARY
+    // resolver classifies THAT (issue #2134): a region-LESS name in a stack that
+    // reads across a region boundary is `ambiguous`, so the refusal still fires
+    // — one layer down, on the complete expression, with the same safety.
+    //
+    // Before issue #2157 this same input threw the pre-pass's own
+    // `SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE`. The CODE is the discriminator
+    // here: it is the one observable that separates "refused before assembly
+    // because nothing could classify it" from "classified after assembly and
+    // found genuinely ambiguous", and only the second is reachable now.
     useState(makeLeakyState(IRELAND_PASSWORD, 'imports'));
 
     const err = await scrub(SUB_ASSEMBLED_EXPR).catch((e: unknown) => e);
 
-    expect((err as { code?: string }).code).toBe('SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE');
-    expect((err as { exitCode?: number }).exitCode).toBe(2);
+    expect((err as { code?: string }).code).toBe('DYNAMIC_REFERENCE_REGION_AMBIGUOUS');
     const message = (err as Error).message;
-    // Names the LEAF, not only the resource — an assembled reference is one leaf
-    // of a bag that can carry hundreds.
-    expect(message).toContain('MasterUserPassword');
-    expect(message).toContain("resource 'Db'");
+    // The ASSEMBLED name, which is the point: the pre-pass could only ever have
+    // named the raw `${Env}-db` spelling, because that is all it could see.
+    expect(message).toContain('prod-db');
     expect(message).toContain(PRODUCER_REGION);
-    expect(message).toContain('ASSEMBLED');
-    // Refused BEFORE any lookup, in either region.
+    // Still refused BEFORE any lookup, in either region — the property the old
+    // pre-pass refusal bought, now bought downstream.
     expect(secretSends).toHaveLength(0);
     expect(stateBackend.saveState).not.toHaveBeenCalled();
     expect(lockManager.releaseLock).toHaveBeenCalledTimes(1);
   });
 
-  it('an Fn::Join-SPLIT reference is refused for the same reason', async () => {
+  it('an Fn::Join-SPLIT reference is refused by the resolver for the same reason (#2157)', async () => {
     // The other assembly shape: the reference is split ACROSS parts, so its
-    // opening lives in a leaf with no closing brace anywhere in it.
+    // opening lives in a leaf with no closing brace anywhere in it. `resolveJoin`
+    // joins the parts and re-enters `resolveDynamicReferences`, which reaches the
+    // same verdict on the same assembled name.
     useState(makeLeakyState(IRELAND_PASSWORD, 'outputReads'));
 
     const err = await scrub(JOIN_SPLIT_EXPR).catch((e: unknown) => e);
 
-    expect((err as { code?: string }).code).toBe('SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE');
+    expect((err as { code?: string }).code).toBe('DYNAMIC_REFERENCE_REGION_AMBIGUOUS');
+    expect((err as Error).message).toContain('prod-db');
     expect(secretSends).toHaveLength(0);
     expect(stateBackend.saveState).not.toHaveBeenCalled();
   });
@@ -855,34 +893,80 @@ describe('cdkd scrub resolves a foreign-region secret in ITS OWN region (issue #
     }
   );
 
-  it('a TRAILING Fn::Sub placeholder is refused even though the count sees one token per opening', async () => {
+  it('a TRAILING Fn::Sub placeholder is DEFERRED here and refused by the resolver (#2157)', async () => {
     // The shape the opening/token count cannot catch: the scan closes one brace
     // short and returns a token, of the right class, one per opening. Only the
-    // "a whole token still contains `${`" test refuses it.
+    // "a whole token still contains `${`" test spots it — and post-#2157 that
+    // test DEFERS rather than refusing, so the truncated token is never
+    // classified here at all. The NAME form is genuinely unattributable, so the
+    // resolver's own refusal fires on it.
     useState(makeLeakyState(IRELAND_PASSWORD, 'imports'));
 
     const err = await scrub(TRAILING_SUB_NAME_EXPR).catch((e: unknown) => e);
 
-    expect((err as { code?: string }).code).toBe('SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE');
-    expect((err as { exitCode?: number }).exitCode).toBe(2);
+    expect((err as { code?: string }).code).toBe('DYNAMIC_REFERENCE_REGION_AMBIGUOUS');
     expect(secretSends).toHaveLength(0);
     expect(stateBackend.saveState).not.toHaveBeenCalled();
   });
 
-  it('the ARN form of that trailing placeholder is refused BEFORE any lookup, not after one fails', async () => {
-    // The discriminating half. Without the `${` test this leaf classified as
-    // `named-region`, so the producer region WAS asked — with a secret id still
-    // carrying a literal `${Field}` — and safety came only from that lookup
-    // happening to fail into `SCRUB_CROSS_REGION_SECRET_UNRESOLVED`. The
-    // producer region IS primed here (see `beforeEach`), so that luck is
-    // removed: the assertion is that nobody is asked at all.
+  it('the ARN form of that trailing placeholder is routed to the region the ARN NAMES (#2157)', async () => {
+    // The discriminating half, and the one case in this group where the
+    // relaxation changes the OUTCOME rather than the error code: an ARN names
+    // its own region, so there is nothing ambiguous about it and the resolver
+    // resolves it — against the PRODUCER's endpoint, which is the property that
+    // matters. The pre-#2157 pre-pass refused this leaf outright.
+    //
+    // The consumer region must NOT be asked. That is the safety claim the old
+    // refusal bought, and this asserts it POSITIVELY (which region was asked)
+    // rather than as "nobody was asked", so a run that died early cannot pass.
     useState(makeLeakyState(IRELAND_PASSWORD, 'outputReads'));
 
-    const err = await scrub(TRAILING_SUB_ARN_EXPR).catch((e: unknown) => e);
+    const res = await scrub(TRAILING_SUB_ARN_EXPR);
 
-    expect((err as { code?: string }).code).toBe('SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE');
-    expect(secretSends).toHaveLength(0);
-    expect(stateBackend.saveState).not.toHaveBeenCalled();
+    expect(secretSends.map((s) => s.ctorRegion)).toEqual([PRODUCER_REGION]);
+    // Nothing is scrubbed, and that is NOT a #2157 regression -- it is the
+    // outcome this exact leaf already had on `main` in a stack with NO foreign
+    // producer region on record. `classifyReplaySecretRegion` verdicts an
+    // ARN-form token `named-region` whatever evidence it holds (measured: the
+    // `importedProducerRegions` loop is reached only for a region-LESS name),
+    // so the pre-#2157 pre-pass fetched this same secret from this same region
+    // and reported the same clean result there. The refusal fired ONLY when
+    // evidence happened to be on record, which is the inconsistency #2157
+    // removes: one shape, one behaviour.
+    //
+    // The reference is malformed -- a raw string leaf carrying `${Field}` with
+    // no `Fn::Sub` to substitute it -- so its truncated token names no JSON key
+    // and matches no stored plaintext. A template like this fails at deploy, so
+    // no cdkd-written state can position a real secret through it.
+    expect(res).toMatchObject({ recordsChanged: 0, secretsFound: 0 });
+  });
+
+  it('the shape #2157 UNLOCKS: an Fn::Sub-assembled FOREIGN ARN is scrubbed, not refused', async () => {
+    // The case the relaxation exists for, and the discriminator for the whole
+    // change: `main` REFUSES this leaf (the raw string opens one reference and
+    // the scan finds zero whole tokens, and a foreign producer region is on
+    // record), so the stack is unscrubbable with no bypass flag while its
+    // state.json still holds the plaintext.
+    //
+    // Post-#2157 the pre-pass defers, `resolveSub` assembles the complete
+    // foreign-ARN reference, and the resolver routes it to the region the ARN
+    // NAMES (issue #2134). Both halves are asserted positively: the producer's
+    // endpoint answered, the consumer's was never asked, and the plaintext is
+    // gone from the saved record.
+    useState(makeLeakyState(IRELAND_PASSWORD, 'imports'));
+
+    const res = await scrub(SUB_ASSEMBLED_FOREIGN_ARN_EXPR);
+
+    expect(secretSends.map((s) => s.ctorRegion)).toEqual([PRODUCER_REGION]);
+    expect(res.recordsChanged).toBe(1);
+    const saved = stateBackend.saveState.mock.calls[0]![2] as StackState;
+    expect(JSON.stringify(saved)).not.toContain(IRELAND_PASSWORD);
+    // The EXPRESSION is what replaces it, not merely "not the plaintext" -- a
+    // record scrubbed to `undefined` would satisfy the negative alone. It is
+    // the ASSEMBLED expression rather than the `Fn::Sub` node: scrub restores
+    // what the deploy would persist post-#1934, and the deploy persists the
+    // reference, not the intrinsic that built it.
+    expect(saved.resources['Db']!.properties['MasterUserPassword']).toBe(PRODUCER_ARN_EXPR);
   });
 
   it('a partial-resolution DEBUG line masks what it echoes from the resolver', async () => {

@@ -2413,6 +2413,109 @@ describe('cdkd scrub follows a RE-EXPORT chain (issue #2146)', () => {
     expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
   });
 
+  it('a producer DECLARING the expression in the UNTAKEN Fn::If branch does not refuse (#2150)', async () => {
+    // THE #2150 SHAPE, and the half issue #2146 deliberately left alone: the
+    // producer does not RE-EXPORT anything, it DECLARES the expression itself,
+    // in the TRUE arm of an `Fn::If`. That arm is answered by the literal
+    // `{{resolve:` scan rather than by the hop walk, and the scan used to
+    // `JSON.stringify` the whole node -- so it saw both arms, verdicted
+    // `declared`, and the discriminator then read the DEPLOYED value `plain`,
+    // which carries no expression. The result was `SCRUB_CROSS_STACK_PRODUCER_
+    // PLAINTEXT`: an UNCLEARABLE refusal, because no `cdkd scrub` of the
+    // producer can turn `plain` into an expression and there is no bypass flag,
+    // so every other secret in this consumer stack was stranded with it.
+    //
+    // The scan now applies the SAME branch selection the hop walk does.
+    useChainState({
+      [MID]: { [MID_EXPORT]: 'plain' },
+    });
+
+    const res = await scrub(
+      {
+        MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT },
+        // The stack's OWN secret: the POSITIVE MARKER that the run reached the
+        // rewrite. Without it "did not throw" is also what a run that died
+        // early produces.
+        MasterUsername: SECRET_EXPR,
+      },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: { 'Fn::If': ['IsProd', SECRET_EXPR, 'plain'] },
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    );
+
+    expect(res.recordsChanged).toBe(1);
+    expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
+  });
+
+  it('a producer declaring the expression in the TAKEN Fn::If branch STILL refuses (#2150)', async () => {
+    // The negative control for the case above, and the reason #2150 is a
+    // NARROWING rather than a removal: put the same expression in the FALSE arm
+    // -- the branch scrub selects -- and the refusal fires exactly as it does
+    // without the `Fn::If` at all. A fix that stopped looking inside `Fn::If`
+    // altogether passes the case above and fails this one.
+    useChainState({
+      [MID]: { [MID_EXPORT]: PLAINTEXT },
+    });
+
+    const err = await scrub(
+      { MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT }, MasterUsername: 'admin' },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: { 'Fn::If': ['IsProd', 'plain', SECRET_EXPR] },
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    ).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('SCRUB_CROSS_STACK_PRODUCER_PLAINTEXT');
+    expect((err as Error).message).toContain(`producer stack '${MID}'`);
+    expect(stateBackend.saveState).not.toHaveBeenCalled();
+  });
+
+  it('a MALFORMED Fn::If in the producer\'s output claims NO branch (#2150)', async () => {
+    // Args that are not a 3-tuple: which branch is live is unknowable, so
+    // neither a hop nor a `{{resolve:` sighting may be claimed from it. Asserted
+    // on the SCAN side here -- its twin on the hop side is the `a MALFORMED
+    // Fn::If cannot refuse` case above -- because the two now share one
+    // selection and a regression in it would surface on whichever side is
+    // tested. CloudFormation rejects such a template, so a producer carrying one
+    // cannot have been deployed.
+    useChainState({
+      [MID]: { [MID_EXPORT]: PLAINTEXT },
+    });
+
+    const res = await scrub(
+      {
+        MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT },
+        MasterUsername: SECRET_EXPR,
+      },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: { 'Fn::If': ['IsProd', SECRET_EXPR] },
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    );
+
+    expect(res.recordsChanged).toBe(1);
+    expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
+  });
+
   it('an Fn::If in the producer\'s output does NOT refuse over the UNTAKEN branch', async () => {
     // THE UNCLEARABLE-REFUSAL CLASS, end to end (issue #2146 review). The middle
     // stack publishes a secret import in the TRUE branch and a plain one in the
