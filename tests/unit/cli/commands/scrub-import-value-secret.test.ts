@@ -2516,6 +2516,111 @@ describe('cdkd scrub follows a RE-EXPORT chain (issue #2146)', () => {
     expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
   });
 
+  it('the Fn::If selection descends into an ARRAY, not only the top level (#2150)', async () => {
+    // The array arm of `selectTakenConditionalBranches` was UNFENCED by the
+    // whole suite until the #2157/#2150 review measured it: making that arm
+    // return the node unchanged left every test green. The shape is ordinary --
+    // `Fn::Join`-ing a conditional import into a URL is what the live fixture
+    // one file over does -- so the gap was coverage, not reachability.
+    //
+    // Unpruned, the array's `Fn::If` reaches the scan whole and its TRUE arm's
+    // expression is seen: verdict `declared`, stored value `plain`, unclearable
+    // refusal. Pruned, the FALSE branch leaves nothing to see.
+    useChainState({
+      [MID]: { [MID_EXPORT]: 'plain' },
+    });
+
+    const res = await scrub(
+      {
+        MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT },
+        MasterUsername: SECRET_EXPR,
+      },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: { 'Fn::Join': ['', [{ 'Fn::If': ['IsProd', SECRET_EXPR, 'plain'] }]] },
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    );
+
+    expect(res.recordsChanged).toBe(1);
+    expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
+  });
+
+  it('the Fn::If selection RECURSES into the branch it selects (#2150)', async () => {
+    // Also unfenced before the review: dropping the recursion (returning
+    // `args[2]` raw instead of walking it) left 100/100 green. A nested `Fn::If`
+    // then reaches the scan as a whole node, so the INNER conditional's TRUE arm
+    // is seen and the refusal fires over a producer whose deployed value is the
+    // doubly-false `plain`.
+    useChainState({
+      [MID]: { [MID_EXPORT]: 'plain' },
+    });
+
+    const res = await scrub(
+      {
+        MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT },
+        MasterUsername: SECRET_EXPR,
+      },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: {
+                'Fn::If': [
+                  'IsProd',
+                  SECRET_EXPR,
+                  { 'Fn::If': ['IsStaging', SECRET_EXPR, 'plain'] },
+                ],
+              },
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    );
+
+    expect(res.recordsChanged).toBe(1);
+    expect(savedState().resources['Db']!.properties['MasterUsername']).toBe(SECRET_EXPR);
+  });
+
+  it('an OWN __proto__ key survives the selection, so a secret under it is still seen (#2150)', async () => {
+    // FAIL-OPEN HAZARD, and the direction is what makes it worth a case: a
+    // template is JSON-parsed, so `__proto__` arrives as an OWN key. Rebuilding
+    // the pruned node onto an object LITERAL walks the prototype setter instead
+    // of defining the key, so the key -- and the `{{resolve:` under it -- would
+    // vanish and the producer would look plaintext-free. `Object.create(null)`
+    // is what the three sibling walks in this file already use.
+    //
+    // Built with `JSON.parse` deliberately: an object literal spelled
+    // `{'__proto__': ...}` sets the PROTOTYPE and creates no own key at all, so
+    // it would not reproduce the shape under test.
+    useChainState({
+      [MID]: { [MID_EXPORT]: PLAINTEXT },
+    });
+
+    const err = await scrub(
+      { MasterUserPassword: { 'Fn::ImportValue': MID_EXPORT }, MasterUsername: 'admin' },
+      {
+        appStacks: [
+          chainStack(MID, {
+            DbSecret: {
+              Value: JSON.parse(`{"__proto__": {"Nested": ${JSON.stringify(SECRET_EXPR)}}}`) as unknown,
+              Export: { Name: MID_EXPORT },
+            },
+          }),
+        ],
+      }
+    ).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('SCRUB_CROSS_STACK_PRODUCER_PLAINTEXT');
+    expect(stateBackend.saveState).not.toHaveBeenCalled();
+  });
+
   it('an Fn::If in the producer\'s output does NOT refuse over the UNTAKEN branch', async () => {
     // THE UNCLEARABLE-REFUSAL CLASS, end to end (issue #2146 review). The middle
     // stack publishes a secret import in the TRUE branch and a plain one in the

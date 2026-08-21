@@ -245,6 +245,24 @@ const PROSE_MENTIONS = [
 ] as const;
 
 /** A leaf carrying a FOREIGN token, a LOCAL token and literal text around both. */
+/**
+ * A leaf carrying ONE COMPLETE region-less token AND a bare trailing opening --
+ * the `Fn::Join`-split shape spliced beside a whole reference. Two counted
+ * openings, one whole token, so ONLY the COUNT clause of
+ * `isAssembledSecretReference` sees it; the `${` clause does not, because the
+ * token it found is complete.
+ *
+ * It exists because the count clause was otherwise UNFENCED by the whole suite
+ * (measured on the #2157 review: short-circuiting it to `false` left 15 496 of
+ * 15 496 green). Every other assembled fixture here yields ZERO tokens, and a
+ * zero-token leaf reaches the same identity return through the empty-`verdicts`
+ * path whether the clause fires or not -- so the clause could only be caught by
+ * a leaf where the two paths DIVERGE. Here they do: deferred, the resolver
+ * refuses with its own code; classified by the pre-pass, the complete
+ * region-less token is `ambiguous` and the PRE-PASS refuses with a different
+ * one.
+ */
+const COUNT_ONLY_MIXED_EXPR = `${NAME_EXPR} plus a split part {{resolve:secretsmanager:`;
 const MIXED_TWO_TOKEN_EXPR = `db://${PRODUCER_ARN_EXPR}@host/${CONSUMER_ARN_EXPR}`;
 const MIXED_TWO_TOKEN_PLAINTEXT = `db://${IRELAND_PASSWORD}@host/${TOKYO_PASSWORD}`;
 /** A producer-region secret whose VALUE is itself reference-shaped. */
@@ -410,6 +428,7 @@ async function scrub(
   recordsChanged: number;
   secretsFound: number;
   secretBearingKeys: number;
+  deferredUnresolvedReads: number;
 }> {
   return await scrubStack(
     makeStackInfo(expr, outputs, extraProps, parameters) as never,
@@ -451,6 +470,16 @@ describe('a region-AMBIGUOUS refusal is not swallowed by the best-effort catch (
    * there. It is kept as-is because it reaches the resolver for a DIFFERENT
    * reason -- the pre-pass never sees an opening at all -- and that route is
    * unaffected by #2157, so it still fences the catch independently.
+   *
+   * A SECOND case used to sit beside the one below, asserting that the error was
+   * NOT the pre-pass's `SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE`. #2157 retired
+   * that code, which made the assertion true of every possible outcome, and its
+   * replacement (`secretSends` is empty) could not fail independently either --
+   * this leaf carries no `{{resolve:` opening, so the pre-pass can never issue a
+   * lookup for it whatever the code does. It is DELETED rather than reworded:
+   * the case below already discriminates, because the pre-pass's own ambiguity
+   * refusal carries `SCRUB_SECRET_REGION_AMBIGUOUS` and could only ever have
+   * named the raw `${DbSecretRef}` spelling.
    */
   const ASSEMBLED_VIA_PARAMETER = { 'Fn::Sub': '${DbSecretRef}' };
   const PARAMETER_HOLDING_REFERENCE = { DbSecretRef: { Type: 'String', Default: NAME_EXPR } };
@@ -463,27 +492,6 @@ describe('a region-AMBIGUOUS refusal is not swallowed by the best-effort catch (
     ).rejects.toMatchObject({ code: 'DYNAMIC_REFERENCE_REGION_AMBIGUOUS' });
   });
 
-  it('the PRE-PASS did not fire -- this leaf really did reach the resolver', async () => {
-    // The premise, and it is load-bearing rather than decoration: if the
-    // pre-pass had answered this leaf, the test above would pass while saying
-    // nothing about the catch, which is exactly how its first draft failed.
-    //
-    // RE-POINTED by issue [#2157](https://github.com/go-to-k/cdkd/issues/2157).
-    // This used to assert that the error was NOT the pre-pass's own
-    // `SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE`, which was a real discriminator
-    // while that refusal existed. It no longer does -- the pre-pass DEFERS
-    // instead -- so the same assertion would now be true of every possible
-    // outcome, i.e. vacuous. The premise is asserted through what the pre-pass
-    // still DOES rather than through what it no longer throws: it can perform a
-    // region-pinned lookup of its own, and an empty send log therefore proves
-    // it returned this leaf untouched and the resolver alone answered.
-    useState(makeLeakyState(IRELAND_PASSWORD, 'imports', IRELAND_PASSWORD));
-
-    await expect(
-      scrub(ASSEMBLED_VIA_PARAMETER, undefined, undefined, PARAMETER_HOLDING_REFERENCE)
-    ).rejects.toMatchObject({ code: 'DYNAMIC_REFERENCE_REGION_AMBIGUOUS' });
-    expect(secretSends).toHaveLength(0);
-  });
 
   it('CONTROL: with NO cross-region read on record the same template scrubs normally', async () => {
     // Without this the cases above are also what a scrub refusing EVERY
@@ -939,6 +947,66 @@ describe('cdkd scrub resolves a foreign-region secret in ITS OWN region (issue #
     // and matches no stored plaintext. A template like this fails at deploy, so
     // no cdkd-written state can position a real secret through it.
     expect(res).toMatchObject({ recordsChanged: 0, secretsFound: 0 });
+  });
+
+  it('the COUNT clause defers a leaf that splices a WHOLE token beside a split opening (#2157)', async () => {
+    // THE ONLY CASE THAT FENCES THE COUNT CLAUSE, and it was missing until the
+    // #2157 review measured the clause inert against the whole suite. Every
+    // other assembled fixture yields ZERO tokens, and a zero-token leaf reaches
+    // the identity return through the empty-`verdicts` path anyway -- so the
+    // clause changes nothing there and a probe cannot tell it apart.
+    //
+    // Here the two paths DIVERGE, which is what makes the assertion a
+    // discriminator rather than a restatement:
+    //
+    //   - clause ON  (today): 2 openings vs 1 token -> DEFER the whole leaf ->
+    //     the primary resolver classifies the complete region-less token and
+    //     refuses with `DYNAMIC_REFERENCE_REGION_AMBIGUOUS`.
+    //   - clause OFF: the pre-pass classifies that same token itself and
+    //     refuses with its OWN `SCRUB_SECRET_REGION_AMBIGUOUS`.
+    //
+    // Both refuse, so an rc-only or a "did it refuse" assertion would pass
+    // either way. The CODE is the observable that separates them.
+    useState(makeLeakyState(IRELAND_PASSWORD, 'imports'));
+
+    const err = await scrub(COUNT_ONLY_MIXED_EXPR).catch((e: unknown) => e);
+
+    expect((err as { code?: string }).code).toBe('DYNAMIC_REFERENCE_REGION_AMBIGUOUS');
+    // Deferred means the PRE-PASS asked nobody; the refusal is the resolver's.
+    expect(secretSends).toHaveLength(0);
+    expect(stateBackend.saveState).not.toHaveBeenCalled();
+  });
+
+  it('a DEFERRED reference whose lookup FAILS is a warned finding, not a silent clean run (#2157)', async () => {
+    // THE RESIDUAL THE FIRST DRAFT OF #2157 SHIPPED, found by three independent
+    // reviews. Deferring moves the lookup INSIDE `resolver.resolve`, whose
+    // errors land in `scrubStack`'s best-effort `catch { logger.debug }` -- so
+    // a producer region that cannot answer became a verbose-only line under a
+    // `No plaintext secrets found` summary, over state that still holds the
+    // plaintext. The pre-pass's own `SCRUB_CROSS_REGION_SECRET_UNRESOLVED` is
+    // loud for exactly this failure on the COMPLETE-token spelling, so the two
+    // spellings had diverged in the one direction this command must not.
+    //
+    // NOT a refusal: the error surfaces from a whole-bag resolution and cannot
+    // be attributed to the deferred leaf, so refusing would strand a stack over
+    // an unrelated `Ref` failure. A FINDING instead -- warned, counted, and the
+    // clean line suppressed.
+    prime(PRODUCER_REGION, 'GetSecretValueCommand', new Error('Denied by the producer region'));
+    useState(makeLeakyState(IRELAND_PASSWORD, 'imports'));
+
+    const res = await scrub(SUB_ASSEMBLED_FOREIGN_ARN_EXPR);
+
+    // The COUNT is the discriminator: it is non-zero only on this path.
+    expect(res.deferredUnresolvedReads).toBe(1);
+    const logs = logLines.join('\n');
+    expect(logs).toContain('could not resolve a secret reference the intrinsics ASSEMBLE');
+    // It names the LEAF, not only the resource -- an assembled reference is one
+    // leaf of a bag that can carry hundreds.
+    expect(logs).toContain('MasterUserPassword');
+    // ...and the run must NOT claim the stack is clean over it.
+    expect(logs).not.toContain('No plaintext secrets found');
+    // Neither region's value is echoed by the failure path.
+    expect(logs).not.toContain(IRELAND_PASSWORD);
   });
 
   it('the shape #2157 UNLOCKS: an Fn::Sub-assembled FOREIGN ARN is scrubbed, not refused', async () => {

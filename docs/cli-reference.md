@@ -2923,6 +2923,22 @@ expression in the consumer. `--dry-run` writes nothing, so the producer is never
 rewritten -- a dry run over a not-yet-scrubbed producer is exactly where this
 refusal is expected.
 
+**An ASSEMBLED secret reference whose region cannot answer is a finding too**
+(issue [go-to-k/cdkd#2157](https://github.com/go-to-k/cdkd/issues/2157)). A
+reference the intrinsics build out of parts -- an `Fn::Sub` placeholder inside
+it, an `Fn::Join` that splits it -- does not exist as a complete expression
+until it is resolved, so `scrub`'s region pre-pass cannot classify it and hands
+it to the resolver, which decides the region AFTER assembly and routes it to the
+region its ARN names. When that region then cannot answer -- a denied read, a
+deleted secret -- no needle is recorded for that leaf, so the stack is NOT
+reported clean: scrub warns naming the leaf, and `--fail` exits non-zero. It is
+a finding rather than the exit-2 refusal its complete-token twin raises
+(`SCRUB_CROSS_REGION_SECRET_UNRESOLVED`) because the failure surfaces from a
+whole-bag resolution and cannot be attributed to that leaf, so refusing would
+strand a stack over an unrelated unresolvable `Ref`. Unlike the by-design
+finding below, this one IS fixable: make that region resolve the reference, or
+spell it as one complete literal `{{resolve:...}}`, and re-run.
+
 **A read cdkd declines BY DESIGN is a finding, not a refusal.** The
 cross-account `Fn::GetStackOutput` of a redacted value is never resolved: cdkd
 will not look up a producer account's secret with the consumer's credentials.

@@ -305,6 +305,12 @@ LEGACY_STATE=""
 # the cleanup shred depend on which phase aborted.
 SEEDED_STATE_C=""
 LEGACY_STATE_C=""
+# The phase-3e scrub LOG. Registered here for the same reason the two state
+# scratch files are: it is the file the phase greps for a SecureString
+# plaintext, so an abort between the scrub and the `rm -f` would leave a
+# candidate for one in /tmp -- which is exactly what this file's SECURITY note
+# forbids. It was missed on the first cut of that phase.
+SCRUB_C_LOG=""
 cleanup() {
   rc=$?
   # The INT / TERM traps call `cleanup` and then `exit`, which re-fires the EXIT
@@ -318,7 +324,8 @@ cleanup() {
   # Shred the plaintext-bearing scratch files FIRST — before the AWS teardown,
   # which is slow and can itself fail. `|| true` matches the rest of this
   # function: a cleanup step must never abort the steps after it.
-  rm -f "${SEEDED_STATE}" "${LEGACY_STATE}" "${SEEDED_STATE_C}" "${LEGACY_STATE_C}" >/dev/null 2>&1 || true
+  rm -f "${SEEDED_STATE}" "${LEGACY_STATE}" "${SEEDED_STATE_C}" "${LEGACY_STATE_C}" \
+    "${SCRUB_C_LOG}" >/dev/null 2>&1 || true
   # Best-effort stack teardown first, so the echo parameters go with their
   # stacks and cdkd state is not left pointing at deleted resources.
   ${CLI} destroy "${STACK_A}" "${STACK_B}" "${STACK_C}" \
@@ -767,12 +774,18 @@ SCRUB_C_RC=0
 AWS_REGION="${REGION_A}" ${CLI} scrub "${STACK_C}" \
   --state-bucket "${STATE_BUCKET}" >"${SCRUB_C_LOG}" 2>&1 || SCRUB_C_RC=$?
 # The log may echo the expression (which names the ARN, not the value); it must
-# never echo the value itself.
-if grep -F -q "${EXPECTED_SECURE_B}" "${SCRUB_C_LOG}"; then
-  rm -f "${SCRUB_C_LOG}"
-  echo "FAIL: the scrub output carries the SecureString plaintext" >&2
-  exit 1
-fi
+# never echo the value itself. BOTH regions' values are checked, not only the
+# one this arm expects: the log is `sed`-dumped to stderr on every failure path
+# below, and a WRONG-region resolution would have put region A's secret there --
+# the one case where the check matters most.
+for secret_needle in "${EXPECTED_SECURE_B}" "${EXPECTED_SECURE_A}"; do
+  if grep -F -q "${secret_needle}" "${SCRUB_C_LOG}"; then
+    rm -f "${SCRUB_C_LOG}"
+    SCRUB_C_LOG=""
+    echo "FAIL: the scrub output carries a SecureString plaintext" >&2
+    exit 1
+  fi
+done
 if [ "${SCRUB_C_RC}" -ne 0 ]; then
   sed 's/^/    /' "${SCRUB_C_LOG}" >&2 || true
   rm -f "${SCRUB_C_LOG}"
@@ -793,6 +806,7 @@ if ! grep -qF "Scrubbed 1 resource record(s) in ${STACK_C}" "${SCRUB_C_LOG}"; th
   exit 1
 fi
 rm -f "${SCRUB_C_LOG}"
+SCRUB_C_LOG=""
 assert_state_redacted "${STACK_C}" "${REGION_A}" "${EXPECTED_SECURE_B}" \
   "${ASSEMBLED_FOREIGN_SECURE_ARN}"
 # Same reasoning as phase 3d: purge the plaintext-bearing version now rather

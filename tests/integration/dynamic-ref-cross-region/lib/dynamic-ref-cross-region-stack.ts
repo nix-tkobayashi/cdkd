@@ -204,11 +204,18 @@ export interface AssembledForeignSecretStackProps extends cdk.StackProps {
  * assembled leaf the only thing scrub can answer.
  *
  * THE SHAPE UNDER TEST. The raw template leaf is
- * `{"Fn::Sub": ["{{resolve:ssm:${TargetArn}}}", {...}]}` -- a literal
- * `{{resolve:ssm:` opening whose token the shared scan cannot close, because
- * `[^}]+` stops at the `}` of `${TargetArn}`. That is one opening and zero
- * whole tokens, so `isAssembledSecretReference` fires. Pre-#2157 that plus a
- * foreign producer region on record threw
+ * `{"Fn::Sub": ["{{resolve:ssm:${TargetArn}}}", {...}]}`. MEASURED rather than
+ * reasoned about, because the obvious reading is wrong: `[^}]+` stops at the
+ * `}` of `${TargetArn}` and the following `}}` closes the match ONE BRACE
+ * SHORT, so the scan returns exactly ONE whole-looking token for ONE opening --
+ * the COUNT clause of `isAssembledSecretReference` does NOT see this leaf. What
+ * catches it is the second clause: a whole token that still contains `${`. (The
+ * count clause's own shape is the MID-string placeholder, covered by the unit
+ * suite's `SUB_ASSEMBLED_FOREIGN_ARN_EXPR` and by its splice-beside-a-split
+ * case.)
+ *
+ * Pre-#2157 a hit on either clause, plus a
+ * foreign producer region on record, threw
  * `SCRUB_SECRET_REFERENCE_UNCLASSIFIABLE` -- exit 2, no bypass flag, the whole
  * stack unscrubbable while its state.json still held the plaintext. Post-#2157
  * the leaf is deferred to the resolver, which sees the ASSEMBLED expression,
